@@ -1,0 +1,38 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id           Int       @id @default(autoincrement())
+  subject      String
+  notes        String
+  durationMin  Int
+  status       String    @default("ACTIVE") // ACTIVE | AWAITING_VERIFICATION | UNLOCKED
+  startedAt    DateTime  @default(now())
+  questions    Question[]
+  attempts     QuizAttempt[]
+}
+
+model Question {
+  id            Int      @id @default(autoincrement())
+  sessionId     Int
+  session       Session  @relation(fields: [sessionId], references: [id])
+  questionText  String
+  options       String[]
+  correctIndex  Int
+}
+
+model QuizAttempt {
+  id         Int      @id @default(autoincrement())
+  sessionId  Int
+  session    Session  @relation(fields: [sessionId], references: [id])
+  answers    Int[]
+  score      Float
+  passed     Boolean
+  createdAt  DateTime @default(now())
+}
