@@ -34,10 +34,29 @@ async function ensureTables() {
         back TEXT NOT NULL
       )
     `);
-    console.log('Flashcard table ready');
+    // How many questions the student asked for. Existing sessions get 5,
+    // which is what they were generated with.
+    await pool.query(`
+      ALTER TABLE "Session"
+      ADD COLUMN IF NOT EXISTS "questionCount" INTEGER NOT NULL DEFAULT 5
+    `);
+    console.log('Schema ready');
   } catch (err) {
-    console.error('Could not prepare Flashcard table:', err.message);
+    console.error('Could not prepare schema:', err.message);
   }
+}
+
+// Students can ask for more or fewer questions, within reason. Below 3
+// a single lucky guess passes you; above 15 the AI starts inventing
+// questions the notes cannot actually answer.
+const MIN_QUESTIONS = 3;
+const MAX_QUESTIONS = 15;
+const DEFAULT_QUESTIONS = 5;
+
+function clampQuestionCount(value) {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n)) return DEFAULT_QUESTIONS;
+  return Math.min(MAX_QUESTIONS, Math.max(MIN_QUESTIONS, n));
 }
 
 app.get('/', (req, res) => {
@@ -110,17 +129,17 @@ async function getSession(sessionId) {
 // Create a new study session.
 app.post('/sessions', async (req, res) => {
   try {
-    const { subject, notes, durationMin } = req.body;
+    const { subject, notes, durationMin, questionCount } = req.body;
 
     if (!subject || !notes) {
       return res.status(400).json({ error: 'subject and notes are required' });
     }
 
     const result = await pool.query(
-      `INSERT INTO "Session" (subject, notes, "durationMin", status)
-       VALUES ($1, $2, $3, 'ACTIVE')
+      `INSERT INTO "Session" (subject, notes, "durationMin", "questionCount", status)
+       VALUES ($1, $2, $3, $4, 'ACTIVE')
        RETURNING *`,
-      [subject, notes, durationMin || 25]
+      [subject, notes, durationMin || 25, clampQuestionCount(questionCount)]
     );
 
     res.json(result.rows[0]);
@@ -299,11 +318,14 @@ app.post('/sessions/:id/generate-questions', async (req, res) => {
       return res.json({ demo: false, questions: forClient(existing.rows) });
     }
 
+    const wanted = clampQuestionCount(session.questionCount);
+
     const prompt = `You are writing a comprehension quiz from a student's own study notes on "${session.subject}".
 
-Generate exactly 5 multiple-choice questions.
+Generate exactly ${wanted} multiple-choice questions.
 
 Rules:
+- If the notes genuinely do not contain enough material for ${wanted} distinct questions, write fewer rather than padding with trivia or repeating the same fact twice.
 - Every question and every correct answer must be fully answerable from the notes below. Do not test any fact that is not stated in the notes.
 - Do not use outside knowledge, even if it is correct and related.
 - Favour questions that require applying or connecting ideas in the notes over questions that just locate a phrase.
@@ -342,6 +364,9 @@ ${session.notes}`;
       if (!questions.length) {
         return res.status(502).json({ error: 'The quiz came back unusable. Try again.' });
       }
+      // Models overshoot more often than they undershoot. Never give the
+      // student more than they asked for.
+      questions = questions.slice(0, wanted);
     }
 
     const savedQuestions = [];
