@@ -10,39 +10,217 @@ app.use(express.json());
 // fundamentally: data now lives in Postgres, not in a JS array that resets.
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
+/* ------------------------------------------------------------------
+   Make sure the Flashcard table exists.
+   Runs once on boot. IF NOT EXISTS means it is safe to run every time
+   and does nothing if the table is already there — so nobody has to
+   open a database console to add this feature.
+   ------------------------------------------------------------------ */
+async function ensureTables() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS "Flashcard" (
+        id SERIAL PRIMARY KEY,
+        "sessionId" INTEGER NOT NULL REFERENCES "Session"(id),
+        front TEXT NOT NULL,
+        back TEXT NOT NULL
+      )
+    `);
+    console.log('Flashcard table ready');
+  } catch (err) {
+    console.error('Could not prepare Flashcard table:', err.message);
+  }
+}
+
 app.get('/', (req, res) => {
   res.send('ScholarOS server is running!');
 });
 
-// Create a new study session — now INSERTs a real row into Postgres.
-app.post('/sessions', async (req, res) => {
-  const { subject, notes, durationMin } = req.body;
+/* ------------------------------------------------------------------
+   Shared helper: ask Groq for something and get JSON back.
 
-  const result = await pool.query(
-    `INSERT INTO "Session" (subject, notes, "durationMin", status)
-     VALUES ($1, $2, $3, 'ACTIVE')
-     RETURNING *`,
-    [subject, notes, durationMin]
-  );
-
-  res.json(result.rows[0]);
-});
-
-// List all sessions — now a real SELECT from Postgres.
-app.get('/sessions', async (req, res) => {
-  const result = await pool.query(`SELECT * FROM "Session" ORDER BY id`);
-  res.json(result.rows);
-});
-
-// Generate quiz questions from a session's notes, and save them for real.
-app.post('/sessions/:id/generate-questions', async (req, res) => {
-  const sessionId = parseInt(req.params.id);
-
-  const sessionResult = await pool.query(`SELECT * FROM "Session" WHERE id = $1`, [sessionId]);
-  const session = sessionResult.rows[0];
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
+   Every AI call can fail in the same four ways — no key, network
+   error, non-200 response, or a reply that isn't valid JSON. Handling
+   that once here means neither route can forget it and leave the
+   desktop app hanging forever on a spinner.
+   ------------------------------------------------------------------ */
+async function askGroqForJson(prompt) {
+  if (!process.env.GROQ_API_KEY) {
+    return { ok: false, reason: 'no-key' };
   }
+
+  let response;
+  try {
+    response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'openai/gpt-oss-120b',
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+  } catch (err) {
+    return { ok: false, reason: 'network', detail: err.message };
+  }
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    return { ok: false, reason: 'ai-error', detail: `${response.status} ${body.slice(0, 200)}` };
+  }
+
+  const data = await response.json().catch(() => null);
+  const raw = data && data.choices && data.choices[0] && data.choices[0].message
+    ? data.choices[0].message.content
+    : null;
+
+  if (!raw) return { ok: false, reason: 'empty' };
+
+  try {
+    // Models often wrap JSON in ```json fences even when told not to.
+    return { ok: true, value: JSON.parse(raw.replace(/```json|```/g, '').trim()) };
+  } catch {
+    return { ok: false, reason: 'bad-json', detail: raw.slice(0, 200) };
+  }
+}
+
+// Small helper so every route can look a session up the same way.
+async function getSession(sessionId) {
+  const result = await pool.query(`SELECT * FROM "Session" WHERE id = $1`, [sessionId]);
+  return result.rows[0] || null;
+}
+
+/* ==================================================================
+   Sessions
+   ================================================================== */
+
+// Create a new study session.
+app.post('/sessions', async (req, res) => {
+  try {
+    const { subject, notes, durationMin } = req.body;
+
+    if (!subject || !notes) {
+      return res.status(400).json({ error: 'subject and notes are required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO "Session" (subject, notes, "durationMin", status)
+       VALUES ($1, $2, $3, 'ACTIVE')
+       RETURNING *`,
+      [subject, notes, durationMin || 25]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('POST /sessions failed:', err);
+    res.status(500).json({ error: 'Could not create the session' });
+  }
+});
+
+// List sessions.
+app.get('/sessions', async (req, res) => {
+  try {
+    // Deliberately does NOT return the notes column. Notes are the
+    // student's own study material and there is no login yet, so
+    // anyone who found this URL could read everybody's work.
+    const result = await pool.query(
+      `SELECT id, subject, "durationMin", status, "startedAt"
+       FROM "Session" ORDER BY id DESC LIMIT 100`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('GET /sessions failed:', err);
+    res.status(500).json({ error: 'Could not list sessions' });
+  }
+});
+
+/* ==================================================================
+   Flashcards — study material, shown DURING the session
+   ================================================================== */
+
+app.post('/sessions/:id/flashcards', async (req, res) => {
+  try {
+    const sessionId = parseInt(req.params.id);
+    const session = await getSession(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    // If we already built cards for this session, hand back the same
+    // ones instead of paying for a second AI call and producing a
+    // different deck halfway through someone's studying.
+    const existing = await pool.query(
+      `SELECT front, back FROM "Flashcard" WHERE "sessionId" = $1 ORDER BY id`,
+      [sessionId]
+    );
+    if (existing.rows.length) {
+      return res.json({ flashcards: existing.rows });
+    }
+
+    const prompt = `You are making revision flashcards from a student's own study notes on "${session.subject}".
+
+Generate between 6 and 12 flashcards.
+
+Rules:
+- Every card must be answerable purely from the notes below. Do not use outside knowledge.
+- "front" is a short question or a term. "back" is the answer, one or two sentences.
+- Cover the whole set of notes, not just the opening lines.
+- Do not repeat the same fact on two different cards.
+
+Return ONLY valid JSON, nothing else: [{"front":"...","back":"..."}]
+
+Notes:
+${session.notes}`;
+
+    const ai = await askGroqForJson(prompt);
+
+    if (!ai.ok) {
+      console.error('flashcards AI failed:', ai.reason, ai.detail || '');
+      // An empty list is a valid answer the app already handles calmly:
+      // it says "flashcards not available" and the session carries on.
+      return res.json({ flashcards: [], reason: ai.reason });
+    }
+
+    const clean = (Array.isArray(ai.value) ? ai.value : [])
+      .filter(c => c && typeof c.front === 'string' && typeof c.back === 'string')
+      .filter(c => c.front.trim() && c.back.trim())
+      .slice(0, 12);
+
+    for (const c of clean) {
+      await pool.query(
+        `INSERT INTO "Flashcard" ("sessionId", front, back) VALUES ($1, $2, $3)`,
+        [sessionId, c.front.trim(), c.back.trim()]
+      );
+    }
+
+    res.json({ flashcards: clean });
+
+  } catch (err) {
+    console.error('POST /sessions/:id/flashcards failed:', err);
+    res.status(500).json({ error: 'Could not build flashcards' });
+  }
+});
+
+/* ==================================================================
+   Quiz
+   ================================================================== */
+
+app.post('/sessions/:id/generate-questions', async (req, res) => {
+  try {
+    const sessionId = parseInt(req.params.id);
+    const session = await getSession(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    // Only ever generate one set of questions per session. Generating a
+    // second set used to leave the session with ten questions while the
+    // app only held five, so grading compared answers to the wrong ones.
+    const existing = await pool.query(
+      `SELECT * FROM "Question" WHERE "sessionId" = $1 ORDER BY id`,
+      [sessionId]
+    );
+    if (existing.rows.length) {
+      return res.json({ demo: false, questions: forClient(existing.rows) });
+    }
 
     const prompt = `You are writing a comprehension quiz from a student's own study notes on "${session.subject}".
 
@@ -59,104 +237,130 @@ Return ONLY valid JSON, nothing else: [{"question":"...","options":["...","...",
 
 Notes:
 ${session.notes}`;
-  let questions;
-  let demo = false;
 
-      if (!process.env.GROQ_API_KEY) {
-    demo = true;
-    questions = [
-      {
-        question: `[DEMO — no API key set] What is the main topic of these notes on ${session.subject}?`,
-        options: ['The correct topic', 'A wrong option', 'Another wrong option', 'Yet another wrong option'],
-        correct_index: 0
+    let questions;
+    let demo = false;
+
+    const ai = await askGroqForJson(prompt);
+
+    if (!ai.ok) {
+      if (ai.reason === 'no-key') {
+        demo = true;
+        questions = [{
+          question: `[DEMO — no API key set] What is the main topic of these notes on ${session.subject}?`,
+          options: ['The correct topic', 'A wrong option', 'Another wrong option', 'Yet another wrong option'],
+          correct_index: 0
+        }];
+      } else {
+        console.error('quiz AI failed:', ai.reason, ai.detail || '');
+        return res.status(502).json({ error: 'Could not write the quiz. Try again in a moment.' });
       }
-    ];
-  } else {
-            const aiResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'openai/gpt-oss-120b',
-        messages: [{ role: 'user', content: prompt }]
-      })
-    });
-    const data = await aiResponse.json();
-    console.log('GROQ RESPONSE:', JSON.stringify(data));
-    const raw = data.choices[0].message.content.replace(/```json|```/g, '').trim();
-    questions = JSON.parse(raw);
-  }
+    } else {
+      questions = (Array.isArray(ai.value) ? ai.value : []).filter(q =>
+        q && typeof q.question === 'string' &&
+        Array.isArray(q.options) && q.options.length >= 2 &&
+        Number.isInteger(q.correct_index) &&
+        q.correct_index >= 0 && q.correct_index < q.options.length
+      );
+      if (!questions.length) {
+        return res.status(502).json({ error: 'The quiz came back unusable. Try again.' });
+      }
+    }
 
-  // Save each generated question as a real row in Postgres.
-  const savedQuestions = [];
-  for (const q of questions) {
-    const inserted = await pool.query(
-      `INSERT INTO "Question" ("sessionId", "questionText", options, "correctIndex")
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [sessionId, q.question, q.options, q.correct_index]
-    );
-    savedQuestions.push(inserted.rows[0]);
-  }
+    const savedQuestions = [];
+    for (const q of questions) {
+      const inserted = await pool.query(
+        `INSERT INTO "Question" ("sessionId", "questionText", options, "correctIndex")
+         VALUES ($1, $2, $3, $4)
+         RETURNING *`,
+        [sessionId, q.question, q.options, q.correct_index]
+      );
+      savedQuestions.push(inserted.rows[0]);
+    }
 
-  res.json({ demo, questions: savedQuestions });
+    res.json({ demo, questions: forClient(savedQuestions) });
+
+  } catch (err) {
+    console.error('POST /sessions/:id/generate-questions failed:', err);
+    res.status(500).json({ error: 'Could not generate questions' });
+  }
 });
+
+/* Strips "correctIndex" before anything goes to the desktop app.
+
+   This matters more than it looks. Electron ships Chrome DevTools, so
+   a student can press F12, open the Network tab and read the response.
+   If the right answer is in there, they unlock their apps in seconds
+   without studying and the whole product is pointless. Marking happens
+   on this server, where the student cannot see or change it. */
+function forClient(rows) {
+  return rows.map(q => ({
+    id: q.id,
+    questionText: q.questionText,
+    options: q.options
+  }));
+}
 
 // Grade a quiz submission and unlock the session if it passes.
 app.post('/sessions/:id/submit-quiz', async (req, res) => {
-  const sessionId = parseInt(req.params.id);
-  const { answers } = req.body;
+  try {
+    const sessionId = parseInt(req.params.id);
+    const { answers } = req.body;
 
-  const sessionResult = await pool.query(`SELECT * FROM "Session" WHERE id = $1`, [sessionId]);
-  const session = sessionResult.rows[0];
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-
-  const questionsResult = await pool.query(
-    `SELECT * FROM "Question" WHERE "sessionId" = $1 ORDER BY id`,
-    [sessionId]
-  );
-  const questions = questionsResult.rows;
-  if (questions.length === 0) {
-    return res.status(400).json({ error: 'No questions generated for this session yet' });
-  }
-
-  let correctCount = 0;
-  questions.forEach((q, i) => {
-    if (q.correctIndex === answers[i]) {
-      correctCount++;
+    if (!Array.isArray(answers)) {
+      return res.status(400).json({ error: 'answers must be an array' });
     }
-  });
 
-  const score = correctCount / questions.length;
-  const PASS_THRESHOLD = 0.6;
-  const passed = score >= PASS_THRESHOLD;
+    const session = await getSession(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
 
-  await pool.query(
-    `INSERT INTO "QuizAttempt" ("sessionId", answers, score, passed)
-     VALUES ($1, $2, $3, $4)`,
-    [sessionId, answers, score, passed]
-  );
+    const questionsResult = await pool.query(
+      `SELECT * FROM "Question" WHERE "sessionId" = $1 ORDER BY id`,
+      [sessionId]
+    );
+    const questions = questionsResult.rows;
+    if (questions.length === 0) {
+      return res.status(400).json({ error: 'No questions generated for this session yet' });
+    }
 
-  if (passed) {
-    await pool.query(`UPDATE "Session" SET status = 'UNLOCKED' WHERE id = $1`, [sessionId]);
+    let correctCount = 0;
+    questions.forEach((q, i) => {
+      if (q.correctIndex === answers[i]) correctCount++;
+    });
+
+    const score = correctCount / questions.length;
+    const PASS_THRESHOLD = 0.6;
+    const passed = score >= PASS_THRESHOLD;
+
+    await pool.query(
+      `INSERT INTO "QuizAttempt" ("sessionId", answers, score, passed)
+       VALUES ($1, $2, $3, $4)`,
+      [sessionId, answers, score, passed]
+    );
+
+    if (passed) {
+      await pool.query(`UPDATE "Session" SET status = 'UNLOCKED' WHERE id = $1`, [sessionId]);
+    }
+
+    const updatedSession = await getSession(sessionId);
+
+    res.json({
+      correctCount,
+      totalQuestions: questions.length,
+      score,
+      passed,
+      sessionStatus: updatedSession.status
+    });
+
+  } catch (err) {
+    console.error('POST /sessions/:id/submit-quiz failed:', err);
+    res.status(500).json({ error: 'Could not mark the quiz' });
   }
-
-  const updatedSession = await pool.query(`SELECT * FROM "Session" WHERE id = $1`, [sessionId]);
-
-  res.json({
-    correctCount,
-    totalQuestions: questions.length,
-    score,
-    passed,
-    sessionStatus: updatedSession.rows[0].status
-  });
 });
 
-const PORT = 3000;
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+const PORT = process.env.PORT || 3000;
+ensureTables().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+  });
 });

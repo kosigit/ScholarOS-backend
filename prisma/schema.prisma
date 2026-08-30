@@ -16,6 +16,7 @@ model Session {
   startedAt    DateTime  @default(now())
   questions    Question[]
   attempts     QuizAttempt[]
+  flashcards   Flashcard[]
 }
 
 model Question {
@@ -35,4 +36,12 @@ model QuizAttempt {
   score      Float
   passed     Boolean
   createdAt  DateTime @default(now())
+}
+
+model Flashcard {
+  id         Int      @id @default(autoincrement())
+  sessionId  Int
+  session    Session  @relation(fields: [sessionId], references: [id])
+  front      String
+  back       String
 }
