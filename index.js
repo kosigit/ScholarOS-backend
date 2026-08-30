@@ -44,8 +44,21 @@ app.post('/sessions/:id/generate-questions', async (req, res) => {
     return res.status(404).json({ error: 'Session not found' });
   }
 
-  const prompt = `Generate exactly 5 multiple-choice questions based only on these notes on "${session.subject}". Test understanding, not verbatim recall. Return ONLY valid JSON in this exact shape, nothing else: [{"question":"...","options":["...","...","...","..."],"correct_index":0}]\n\nNotes:\n${session.notes}`;
+    const prompt = `You are writing a comprehension quiz from a student's own study notes on "${session.subject}".
 
+Generate exactly 5 multiple-choice questions.
+
+Rules:
+- Every question and every correct answer must be fully answerable from the notes below. Do not test any fact that is not stated in the notes.
+- Do not use outside knowledge, even if it is correct and related.
+- Favour questions that require applying or connecting ideas in the notes over questions that just locate a phrase.
+- Each question needs exactly 4 options with exactly one correct answer.
+- Wrong options should be plausible, not obviously absurd.
+
+Return ONLY valid JSON, nothing else: [{"question":"...","options":["...","...","...","..."],"correct_index":0}]
+
+Notes:
+${session.notes}`;
   let questions;
   let demo = false;
 
