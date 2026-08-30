@@ -3,7 +3,15 @@ const express = require('express');
 const { Pool } = require('pg');
 
 const app = express();
-app.use(express.json());
+
+// Photos of notes arrive as base64 inside a JSON body, and Express's
+// default limit is 100kb — a phone photo is far bigger than that.
+app.use(express.json({ limit: '25mb' }));
+
+// Which model reads images. Kept in an env var so it can be swapped
+// without a code change when Groq's line-up moves on.
+const VISION_MODEL = process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+const TEXT_MODEL = process.env.GROQ_TEXT_MODEL || 'openai/gpt-oss-120b';
 
 // This "pool" is our connection to the real Postgres database.
 // Every query below goes through this — this is the one thing that changed
@@ -44,7 +52,7 @@ app.get('/', (req, res) => {
    that once here means neither route can forget it and leave the
    desktop app hanging forever on a spinner.
    ------------------------------------------------------------------ */
-async function askGroqForJson(prompt) {
+async function callGroq(model, messages) {
   if (!process.env.GROQ_API_KEY) {
     return { ok: false, reason: 'no-key' };
   }
@@ -57,10 +65,7 @@ async function askGroqForJson(prompt) {
         'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        model: 'openai/gpt-oss-120b',
-        messages: [{ role: 'user', content: prompt }]
-      })
+      body: JSON.stringify({ model, messages })
     });
   } catch (err) {
     return { ok: false, reason: 'network', detail: err.message };
@@ -68,7 +73,7 @@ async function askGroqForJson(prompt) {
 
   if (!response.ok) {
     const body = await response.text().catch(() => '');
-    return { ok: false, reason: 'ai-error', detail: `${response.status} ${body.slice(0, 200)}` };
+    return { ok: false, reason: 'ai-error', detail: `${response.status} ${body.slice(0, 300)}` };
   }
 
   const data = await response.json().catch(() => null);
@@ -77,12 +82,18 @@ async function askGroqForJson(prompt) {
     : null;
 
   if (!raw) return { ok: false, reason: 'empty' };
+  return { ok: true, raw };
+}
+
+async function askGroqForJson(prompt) {
+  const res = await callGroq(TEXT_MODEL, [{ role: 'user', content: prompt }]);
+  if (!res.ok) return res;
 
   try {
     // Models often wrap JSON in ```json fences even when told not to.
-    return { ok: true, value: JSON.parse(raw.replace(/```json|```/g, '').trim()) };
+    return { ok: true, value: JSON.parse(res.raw.replace(/```json|```/g, '').trim()) };
   } catch {
-    return { ok: false, reason: 'bad-json', detail: raw.slice(0, 200) };
+    return { ok: false, reason: 'bad-json', detail: res.raw.slice(0, 200) };
   }
 }
 
@@ -133,6 +144,72 @@ app.get('/sessions', async (req, res) => {
   } catch (err) {
     console.error('GET /sessions failed:', err);
     res.status(500).json({ error: 'Could not list sessions' });
+  }
+});
+
+/* ==================================================================
+   Reading notes out of a photo
+
+   A student snaps their handwritten page, or a lecture slide, and we
+   turn it into text they can then edit and be quizzed on. The picture
+   itself is never stored — only the text comes back, and the student
+   sees it before anything else happens with it.
+   ================================================================== */
+
+const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif'];
+
+app.post('/extract-image', async (req, res) => {
+  try {
+    const { imageBase64, mimeType } = req.body || {};
+
+    if (!imageBase64 || typeof imageBase64 !== 'string') {
+      return res.status(400).json({ ok: false, reason: 'no-image' });
+    }
+    if (!ALLOWED_IMAGE_TYPES.includes(String(mimeType).toLowerCase())) {
+      return res.status(400).json({ ok: false, reason: 'bad-type' });
+    }
+    // Base64 is about 4/3 the size of the raw bytes. Groq rejects
+    // anything over 20MB, so stop well short and say why.
+    if (imageBase64.length > 14_000_000) {
+      return res.status(413).json({ ok: false, reason: 'too-big' });
+    }
+
+    const ai = await callGroq(VISION_MODEL, [{
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: `Transcribe the study notes in this image into plain text.
+
+Rules:
+- Write out everything readable: headings, body text, bullet points, labelled diagrams, equations.
+- Keep the original wording. Do not summarise, correct, explain or add anything.
+- Keep the structure: headings on their own line, bullets as "- ".
+- If a word is genuinely unreadable, write [?] in its place rather than guessing.
+- Return only the transcription. No preamble, no commentary.
+
+If the image contains no readable text at all, reply with exactly: NO_TEXT_FOUND`
+        },
+        { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } }
+      ]
+    }]);
+
+    if (!ai.ok) {
+      console.error('vision failed:', ai.reason, ai.detail || '');
+      return res.status(502).json({ ok: false, reason: ai.reason, detail: ai.detail });
+    }
+
+    const text = ai.raw.trim();
+
+    if (text === 'NO_TEXT_FOUND' || text.replace(/\s/g, '').length < 15) {
+      return res.json({ ok: false, reason: 'no-text' });
+    }
+
+    res.json({ ok: true, text });
+
+  } catch (err) {
+    console.error('POST /extract-image failed:', err);
+    res.status(500).json({ ok: false, reason: 'server-error' });
   }
 });
 
