@@ -258,8 +258,18 @@ function stripThinking(text) {
   return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 }
 
+// Groq's free tier allows 8000 tokens per minute, and that allowance has
+// to cover the reply as well as the prompt. When max_tokens is left unset,
+// Groq reserves the model's entire completion length — thousands of tokens
+// we never actually use — and rejects the whole request with a 413 before
+// the model even runs. Capping the reply keeps us inside the allowance.
+// A flashcard deck or a quiz is comfortably under 2500 tokens of JSON.
+const MAX_ANSWER_TOKENS = 2500;
+
 async function askGroqForJson(prompt) {
-  const res = await callGroq(TEXT_MODEL, [{ role: 'user', content: prompt }]);
+  const res = await callGroq(TEXT_MODEL, [{ role: 'user', content: prompt }], {
+    max_tokens: MAX_ANSWER_TOKENS
+  });
   if (!res.ok) return res;
 
   try {
