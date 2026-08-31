@@ -258,13 +258,28 @@ function stripThinking(text) {
   return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 }
 
-// Groq's free tier allows 8000 tokens per minute, and that allowance has
-// to cover the reply as well as the prompt. When max_tokens is left unset,
-// Groq reserves the model's entire completion length — thousands of tokens
-// we never actually use — and rejects the whole request with a 413 before
-// the model even runs. Capping the reply keeps us inside the allowance.
-// A flashcard deck or a quiz is comfortably under 2500 tokens of JSON.
-const MAX_ANSWER_TOKENS = 2500;
+/* Groq's free tier allows 8000 tokens per minute, counting the prompt we
+   send plus whatever reply length we reserve. A long set of notes blows
+   past that on its own — a 45,000-character document is roughly 11,000
+   tokens before we have written a single instruction — and Groq rejects
+   the whole request with a 413 before the model runs.
+
+   So we cap the notes we send. Roughly 4 characters per token, so 12,000
+   characters is about 3,000 tokens; add the instructions and a 2,000
+   token reply and we land near 5,300 — comfortably inside the allowance.
+
+   The trade-off is real: for very long notes the quiz and flashcards only
+   cover the earlier part. Better than the whole feature failing, but the
+   proper fix for a class of students is Groq's paid tier. */
+const MAX_ANSWER_TOKENS = 2000;
+const MAX_NOTE_CHARS = 12000;
+
+function notesForPrompt(notes) {
+  const text = (notes || '').trim();
+  if (text.length <= MAX_NOTE_CHARS) return text;
+  return text.slice(0, MAX_NOTE_CHARS) +
+    '\n\n[These notes were shortened to fit. Base everything on the text above.]';
+}
 
 async function askGroqForJson(prompt) {
   const res = await callGroq(TEXT_MODEL, [{ role: 'user', content: prompt }], {
@@ -429,7 +444,7 @@ Rules:
 Return ONLY valid JSON, nothing else: [{"front":"...","back":"..."}]
 
 Notes:
-${session.notes}`;
+${notesForPrompt(session.notes)}`;
 
     const ai = await askGroqForJson(prompt);
 
@@ -497,7 +512,7 @@ Rules:
 Return ONLY valid JSON, nothing else: [{"question":"...","options":["...","...","...","..."],"correct_index":0}]
 
 Notes:
-${session.notes}`;
+${notesForPrompt(session.notes)}`;
 
     let questions;
     let demo = false;
