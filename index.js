@@ -32,7 +32,10 @@ app.use(generalLimiter);
 
 // Which model reads images. Kept in an env var so it can be swapped
 // without a code change when Groq's line-up moves on.
-const VISION_MODEL = process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+// meta-llama/llama-4-scout-17b-16e-instruct was Groq's vision model when
+// this was first written, but Groq retired it on 07/17/26. qwen/qwen3.6-27b
+// is their current recommended replacement with vision support.
+const VISION_MODEL = process.env.GROQ_VISION_MODEL || 'qwen/qwen3.6-27b';
 const TEXT_MODEL = process.env.GROQ_TEXT_MODEL || 'openai/gpt-oss-120b';
 
 // This "pool" is our connection to the real Postgres database.
@@ -212,7 +215,7 @@ app.get('/admin', checkAdminAuth, async (req, res) => {
    that once here means neither route can forget it and leave the
    desktop app hanging forever on a spinner.
    ------------------------------------------------------------------ */
-async function callGroq(model, messages) {
+async function callGroq(model, messages, extra = {}) {
   if (!process.env.GROQ_API_KEY) {
     return { ok: false, reason: 'no-key' };
   }
@@ -225,7 +228,7 @@ async function callGroq(model, messages) {
         'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ model, messages })
+      body: JSON.stringify({ model, messages, ...extra })
     });
   } catch (err) {
     return { ok: false, reason: 'network', detail: err.message };
@@ -245,13 +248,24 @@ async function callGroq(model, messages) {
   return { ok: true, raw };
 }
 
+// Some models (Qwen's reasoning models in particular) think out loud
+// inside a <think>...</think> block before their real answer, even when
+// asked not to. We ask the API to hide that (reasoning_format: 'hidden'
+// on the vision call below), but this is a second line of defence in
+// case a future model swap brings the tags back — strip them out of
+// whatever text we're about to treat as "the answer" either way.
+function stripThinking(text) {
+  return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+}
+
 async function askGroqForJson(prompt) {
   const res = await callGroq(TEXT_MODEL, [{ role: 'user', content: prompt }]);
   if (!res.ok) return res;
 
   try {
     // Models often wrap JSON in ```json fences even when told not to.
-    return { ok: true, value: JSON.parse(res.raw.replace(/```json|```/g, '').trim()) };
+    const cleaned = stripThinking(res.raw).replace(/```json|```/g, '').trim();
+    return { ok: true, value: JSON.parse(cleaned) };
   } catch {
     return { ok: false, reason: 'bad-json', detail: res.raw.slice(0, 200) };
   }
@@ -351,14 +365,14 @@ If the image contains no readable text at all, reply with exactly: NO_TEXT_FOUND
         },
         { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } }
       ]
-    }]);
+    }], { reasoning_format: 'hidden' });
 
     if (!ai.ok) {
       console.error('vision failed:', ai.reason, ai.detail || '');
       return res.status(502).json({ ok: false, reason: ai.reason, detail: ai.detail });
     }
 
-    const text = ai.raw.trim();
+    const text = stripThinking(ai.raw);
 
     if (text === 'NO_TEXT_FOUND' || text.replace(/\s/g, '').length < 15) {
       return res.json({ ok: false, reason: 'no-text' });
