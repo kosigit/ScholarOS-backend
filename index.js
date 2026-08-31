@@ -1,12 +1,34 @@
 require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 
 // Photos of notes arrive as base64 inside a JSON body, and Express's
 // default limit is 100kb — a phone photo is far bigger than that.
 app.use(express.json({ limit: '25mb' }));
+app.set('trust proxy', 1);
+
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  message: { error: 'Too many requests. Please wait a few minutes.' }
+});
+
+const aiLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  message: { error: 'Too many AI requests this hour. Please try again later.' }
+});
+
+const visionLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 15,
+  message: { error: 'Too many photo uploads this hour. Please try again later.' }
+});
+
+app.use(generalLimiter);
 
 // Which model reads images. Kept in an env var so it can be swapped
 // without a code change when Groq's line-up moves on.
@@ -176,8 +198,7 @@ app.get('/sessions', async (req, res) => {
    ================================================================== */
 
 const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif'];
-
-app.post('/extract-image', async (req, res) => {
+app.post('/extract-image', visionLimiter,  async (req, res) => {
   try {
     const { imageBase64, mimeType } = req.body || {};
 
@@ -235,8 +256,7 @@ If the image contains no readable text at all, reply with exactly: NO_TEXT_FOUND
 /* ==================================================================
    Flashcards — study material, shown DURING the session
    ================================================================== */
-
-app.post('/sessions/:id/flashcards', async (req, res) => {
+app.post('/sessions/:id/flashcards', aiLimiter,  async (req, res) => {
   try {
     const sessionId = parseInt(req.params.id);
     const session = await getSession(sessionId);
@@ -300,8 +320,7 @@ ${session.notes}`;
 /* ==================================================================
    Quiz
    ================================================================== */
-
-app.post('/sessions/:id/generate-questions', async (req, res) => {
+app.post('/sessions/:id/generate-questions', aiLimiter,  async (req, res) => {
   try {
     const sessionId = parseInt(req.params.id);
     const session = await getSession(sessionId);
