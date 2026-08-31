@@ -63,6 +63,125 @@ app.get('/', (req, res) => {
   res.send('ScholarOS server is running!');
 });
 
+/* ==================================================================
+   Internal analytics — "how many users do we have"
+
+   There is no login system, so there is no such thing as a distinct
+   "user" yet. The nearest honest proxy is a study session being
+   started — every time someone opens the app and begins studying,
+   a row goes into the Session table. This page reads that table and
+   a few others, and nothing else. It is for the team only, so it
+   sits behind a username/password before it will show anything.
+   ================================================================== */
+
+const ADMIN_USER = process.env.ADMIN_USER;
+const ADMIN_PASS = process.env.ADMIN_PASS;
+
+// Real Basic Auth: the browser itself pops up a username/password box
+// for any URL under /admin, no login page needed. If the team never
+// set ADMIN_USER/ADMIN_PASS on the server, the route refuses to work
+// at all rather than silently being open to anyone who finds the URL.
+function checkAdminAuth(req, res, next) {
+  if (!ADMIN_USER || !ADMIN_PASS) {
+    return res.status(503).send('Admin dashboard is not configured on this server (missing ADMIN_USER / ADMIN_PASS).');
+  }
+
+  const header = req.headers.authorization || '';
+  const [scheme, encoded] = header.split(' ');
+
+  if (scheme === 'Basic' && encoded) {
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    const splitAt = decoded.indexOf(':');
+    const user = decoded.slice(0, splitAt);
+    const pass = decoded.slice(splitAt + 1);
+    if (user === ADMIN_USER && pass === ADMIN_PASS) {
+      return next();
+    }
+  }
+
+  res.set('WWW-Authenticate', 'Basic realm="ScholarOS admin"');
+  return res.status(401).send('Authentication required.');
+}
+
+// total attempts of 0 must not become NaN% — it should read as "no
+// quizzes taken yet" instead of a broken-looking number.
+function formatPassRate(totalAttempts, passedAttempts) {
+  if (!totalAttempts) return null;
+  return Math.round((passedAttempts / totalAttempts) * 100);
+}
+
+// Pure on purpose: takes plain numbers in, returns an HTML string out.
+// No database code in here, so it can be checked with fixed sample
+// numbers without needing a real database.
+function renderAdminPage(stats) {
+  const statusRows = stats.byStatus
+    .map(s => `<tr><td>${s.status}</td><td>${s.n}</td></tr>`)
+    .join('');
+
+  const passRate = formatPassRate(stats.totalAttempts, stats.passedAttempts);
+  const passRateText = passRate === null ? '—' : `${passRate}%`;
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ScholarOS — internal stats</title>
+<style>
+  body { background:#141221; color:#eee; font-family: system-ui, sans-serif; padding: 32px; }
+  h1 { color: #b794f6; margin-bottom: 4px; }
+  .sub { color: #999; margin-bottom: 28px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 32px; }
+  .card { background: #1e1b30; border: 1px solid #332e4d; border-radius: 10px; padding: 18px 22px; min-width: 150px; }
+  .card .n { font-size: 28px; font-weight: 700; color: #fff; }
+  .card .l { font-size: 13px; color: #999; margin-top: 4px; }
+  table { border-collapse: collapse; }
+  td { padding: 6px 16px 6px 0; border-bottom: 1px solid #332e4d; }
+</style>
+</head>
+<body>
+  <h1>ScholarOS — internal stats</h1>
+  <div class="sub">Team-only. Not linked anywhere public.</div>
+
+  <div class="grid">
+    <div class="card"><div class="n">${stats.totalSessions}</div><div class="l">sessions, all time</div></div>
+    <div class="card"><div class="n">${stats.sessionsToday}</div><div class="l">sessions, last 24h</div></div>
+    <div class="card"><div class="n">${stats.sessionsWeek}</div><div class="l">sessions, last 7 days</div></div>
+    <div class="card"><div class="n">${stats.distinctSubjects}</div><div class="l">distinct subjects studied</div></div>
+    <div class="card"><div class="n">${passRateText}</div><div class="l">quiz pass rate (${stats.totalAttempts} attempts)</div></div>
+  </div>
+
+  <h3>Sessions by status</h3>
+  <table>${statusRows}</table>
+</body>
+</html>`;
+}
+
+app.get('/admin', checkAdminAuth, async (req, res) => {
+  try {
+    const [totalRes, todayRes, weekRes, statusRes, subjectRes, attemptRes] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS n FROM "Session"`),
+      pool.query(`SELECT COUNT(*)::int AS n FROM "Session" WHERE "startedAt" >= NOW() - INTERVAL '24 hours'`),
+      pool.query(`SELECT COUNT(*)::int AS n FROM "Session" WHERE "startedAt" >= NOW() - INTERVAL '7 days'`),
+      pool.query(`SELECT status, COUNT(*)::int AS n FROM "Session" GROUP BY status ORDER BY status`),
+      pool.query(`SELECT COUNT(DISTINCT subject)::int AS n FROM "Session"`),
+      pool.query(`SELECT COUNT(*)::int AS "totalAttempts", COUNT(*) FILTER (WHERE passed)::int AS "passedAttempts" FROM "QuizAttempt"`)
+    ]);
+
+    res.send(renderAdminPage({
+      totalSessions: totalRes.rows[0].n,
+      sessionsToday: todayRes.rows[0].n,
+      sessionsWeek: weekRes.rows[0].n,
+      byStatus: statusRes.rows,
+      distinctSubjects: subjectRes.rows[0].n,
+      totalAttempts: attemptRes.rows[0].totalAttempts,
+      passedAttempts: attemptRes.rows[0].passedAttempts
+    }));
+  } catch (err) {
+    console.error('GET /admin failed:', err);
+    res.status(500).send('Could not load stats.');
+  }
+});
+
 /* ------------------------------------------------------------------
    Shared helper: ask Groq for something and get JSON back.
 
@@ -485,9 +604,19 @@ app.post('/sessions/:id/submit-quiz', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-ensureTables().then(() => {
-  app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
+// `require.main === module` is Node's way of asking "was this file run
+// directly (`node index.js`), or did some other file `require()` it?"
+// Railway runs it directly, so the server starts as normal. A test file
+// can `require('./index.js')` instead to reach in and check individual
+// functions (like formatPassRate) without booting a real server or
+// needing a real database.
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  ensureTables().then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server listening on port ${PORT}`);
+    });
   });
-});
+}
+
+module.exports = { app, checkAdminAuth, formatPassRate, renderAdminPage };
