@@ -215,37 +215,75 @@ app.get('/admin', checkAdminAuth, async (req, res) => {
    that once here means neither route can forget it and leave the
    desktop app hanging forever on a spinner.
    ------------------------------------------------------------------ */
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/* The 8000-token allowance is per MINUTE, not per request. Flashcards and
+   the quiz are generated seconds apart from the same session, so the
+   second one gets refused for being second in the queue even though it
+   fits on its own — "Limit 8000, Used 3497, Requested 5849".
+
+   Groq says exactly how long to wait ("try again in 10.095s"), so we wait
+   that long and try again instead of failing the student's quiz. There is
+   no timeout on the client side, so waiting is safe. */
+const RATE_LIMIT_RETRIES = 3;
+const MAX_WAIT_MS = 20000;
+
+function retryAfterMs(body, headers) {
+  const header = headers && typeof headers.get === 'function'
+    ? headers.get('retry-after')
+    : null;
+  if (header && !Number.isNaN(Number(header))) {
+    return Math.min(Number(header) * 1000, MAX_WAIT_MS);
+  }
+  const match = /try again in ([\d.]+)s/i.exec(body || '');
+  const seconds = match ? parseFloat(match[1]) : 6;
+  // A second of headroom: the window has to have actually rolled over.
+  return Math.min(Math.ceil(seconds * 1000) + 1000, MAX_WAIT_MS);
+}
+
 async function callGroq(model, messages, extra = {}) {
   if (!process.env.GROQ_API_KEY) {
     return { ok: false, reason: 'no-key' };
   }
 
-  let response;
-  try {
-    response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ model, messages, ...extra })
-    });
-  } catch (err) {
-    return { ok: false, reason: 'network', detail: err.message };
+  for (let attempt = 0; attempt <= RATE_LIMIT_RETRIES; attempt++) {
+    let response;
+    try {
+      response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ model, messages, ...extra })
+      });
+    } catch (err) {
+      return { ok: false, reason: 'network', detail: err.message };
+    }
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+
+      if (response.status === 429 && attempt < RATE_LIMIT_RETRIES) {
+        const wait = retryAfterMs(body, response.headers);
+        console.warn(`Groq rate limited; waiting ${wait}ms before retry ${attempt + 1}/${RATE_LIMIT_RETRIES}`);
+        await sleep(wait);
+        continue;
+      }
+
+      return { ok: false, reason: 'ai-error', detail: `${response.status} ${body.slice(0, 300)}` };
+    }
+
+    const data = await response.json().catch(() => null);
+    const raw = data && data.choices && data.choices[0] && data.choices[0].message
+      ? data.choices[0].message.content
+      : null;
+
+    if (!raw) return { ok: false, reason: 'empty' };
+    return { ok: true, raw };
   }
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    return { ok: false, reason: 'ai-error', detail: `${response.status} ${body.slice(0, 300)}` };
-  }
-
-  const data = await response.json().catch(() => null);
-  const raw = data && data.choices && data.choices[0] && data.choices[0].message
-    ? data.choices[0].message.content
-    : null;
-
-  if (!raw) return { ok: false, reason: 'empty' };
-  return { ok: true, raw };
+  return { ok: false, reason: 'ai-error', detail: 'rate limited after retries' };
 }
 
 // Some models (Qwen's reasoning models in particular) think out loud
@@ -271,8 +309,14 @@ function stripThinking(text) {
    The trade-off is real: for very long notes the quiz and flashcards only
    cover the earlier part. Better than the whole feature failing, but the
    proper fix for a class of students is Groq's paid tier. */
-const MAX_ANSWER_TOKENS = 2000;
-const MAX_NOTE_CHARS = 12000;
+/* Raised from 2000 after a run logged "quiz AI failed: empty": gpt-oss is
+   a reasoning model and spends tokens thinking before it writes anything,
+   so too tight a cap gets used up before a single line of JSON appears.
+   Notes come down to keep the total inside the window — roughly 2250
+   tokens of notes plus instructions, plus 3500 of reply, lands near 6000
+   against the 8000 limit. */
+const MAX_ANSWER_TOKENS = 3500;
+const MAX_NOTE_CHARS = 9000;
 
 function notesForPrompt(notes) {
   const text = (notes || '').trim();
