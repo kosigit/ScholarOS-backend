@@ -446,12 +446,37 @@ app.post('/sessions/:id/submit-quiz', async (req, res) => {
 
     const updatedSession = await getSession(sessionId);
 
+    /* What the student is allowed to see afterwards.
+
+       On a PASS we hand back everything, including which option was
+       right — they've already unlocked, so there is nothing left to
+       game, and seeing the two they missed is the most useful moment
+       for learning.
+
+       On a FAIL we send which questions were wrong but NOT the right
+       answers. They can retake the same quiz, so revealing the answers
+       would turn the retry into a walkthrough and the whole product
+       would be pointless. Knowing *which* ones you missed is enough to
+       send you back to the right part of your notes. */
+    const review = questions.map((q, i) => {
+      const chosen = Number.isInteger(answers[i]) ? answers[i] : null;
+      const entry = {
+        questionText: q.questionText,
+        options: q.options,
+        yourAnswer: chosen,
+        correct: q.correctIndex === chosen
+      };
+      if (passed) entry.correctIndex = q.correctIndex;
+      return entry;
+    });
+
     res.json({
       correctCount,
       totalQuestions: questions.length,
       score,
       passed,
-      sessionStatus: updatedSession.status
+      sessionStatus: updatedSession.status,
+      review
     });
 
   } catch (err) {
